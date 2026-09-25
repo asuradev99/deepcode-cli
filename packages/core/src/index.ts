@@ -64,6 +64,7 @@ export type {
 export {
   getSystemPrompt,
   getCompactPrompt,
+  getCompactPromptMaxChars,
   getRuntimeContext,
   getPlanModePrompt,
   getExtensionRoot,

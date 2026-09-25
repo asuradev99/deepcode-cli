@@ -1043,6 +1043,131 @@ test("compactSession does not mark skill catalog messages compacted", async () =
   assert.equal(toolMessage?.compacted, true);
 });
 
+test("compactSession keeps inline image payloads out of the summarization request", async () => {
+  const workspace = createTempDir("deepcode-compact-image-workspace-");
+  const home = createTempDir("deepcode-compact-image-home-");
+  setHomeDir(home);
+  globalThis.fetch = (async () => ({ ok: true, text: async () => "" }) as Response) as typeof fetch;
+
+  const capturedRequests: any[] = [];
+  const client = {
+    chat: {
+      completions: {
+        create: async (request: any) => {
+          if (isSkillMatchingRequest(request)) {
+            return createSkillMatchingResponse([]);
+          }
+          capturedRequests.push(request);
+          return createChatResponse("<analysis>x</analysis>\ncompact summary", {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+          });
+        },
+      },
+    },
+  };
+  const manager = createMockedClientSessionManagerWithClient(workspace, client);
+  (manager as any).activateSession = async () => {};
+
+  const sessionId = await manager.createSession({ text: "hello" });
+  const now = new Date().toISOString();
+  const append = (message: Record<string, unknown>) => (manager as any).appendSessionMessage(sessionId, message);
+  const imagePayload = "QUJD".repeat(500_000);
+  append({
+    id: "user-image",
+    sessionId,
+    role: "user",
+    content: "The ReadImage tool has loaded `screenshot.png`.",
+    contentParams: [{ type: "image_url", image_url: { url: `data:image/png;base64,${imagePayload}` } }],
+    messageParams: null,
+    compacted: false,
+    visible: false,
+    createTime: now,
+    updateTime: now,
+  });
+  for (let index = 0; index < 6; index += 1) {
+    append({
+      id: `assistant-${index}`,
+      sessionId,
+      role: "assistant",
+      content: `reply ${index}`,
+      contentParams: null,
+      messageParams: null,
+      compacted: false,
+      visible: true,
+      createTime: now,
+      updateTime: now,
+    });
+  }
+
+  await (manager as any).compactSession(sessionId);
+
+  const compactRequest = capturedRequests.find(
+    (request) =>
+      typeof request?.messages?.[0]?.content === "string" &&
+      request.messages[0].content.includes("create a detailed summary of the conversation")
+  );
+  assert.ok(compactRequest, "expected a compaction request");
+  const compactContent = compactRequest.messages[0].content as string;
+  assert.equal(compactContent.includes("data:image/png;base64"), false);
+  assert.equal(compactContent.includes(imagePayload), false);
+  assert.match(compactContent, /\[image omitted from compaction: image\/png, ~\d+ bytes\]/);
+  assert.ok(compactContent.length < 50_000, `expected a small compaction prompt, got ${compactContent.length} chars`);
+  assert.equal(
+    manager.listSessionMessages(sessionId).some((message) => message.compacted),
+    true
+  );
+});
+
+test("a failed compaction request does not fail the session", async () => {
+  const workspace = createTempDir("deepcode-failed-compact-workspace-");
+  const home = createTempDir("deepcode-failed-compact-home-");
+  setHomeDir(home);
+  globalThis.fetch = (async () => ({ ok: true, text: async () => "" }) as Response) as typeof fetch;
+
+  let compactionAttempts = 0;
+  const client = {
+    chat: {
+      completions: {
+        create: async (request: any) => {
+          if (isSkillMatchingRequest(request)) {
+            return createSkillMatchingResponse([]);
+          }
+          const firstContent = request?.messages?.[0]?.content;
+          if (
+            typeof firstContent === "string" &&
+            firstContent.includes("create a detailed summary of the conversation")
+          ) {
+            compactionAttempts += 1;
+            const error = new Error(
+              "400 This model's maximum context length is 1048576 tokens. However, you requested 1571439 tokens."
+            ) as Error & { status: number };
+            error.status = 400;
+            throw error;
+          }
+          return createChatResponse("still working", {
+            prompt_tokens: 200_000,
+            completion_tokens: 5,
+            total_tokens: 200_005,
+          });
+        },
+      },
+    },
+  };
+  const manager = createMockedClientSessionManagerWithClient(workspace, client);
+
+  // The first activation reports usage above the default auto-compaction window,
+  // so the next reply tries to compact and the summarization request fails.
+  const sessionId = await manager.createSession({ text: "hello" });
+  await manager.replySession(sessionId, { text: "next" });
+
+  assert.equal(compactionAttempts, 1);
+  const session = manager.getSession(sessionId);
+  assert.equal(session?.status, "completed");
+  assert.equal(session?.failReason, null);
+});
+
 test("SessionManager dispose disconnects MCP servers", async () => {
   const workspace = createTempDir("deepcode-mcp-dispose-workspace-");
   const serverPath = path.join(workspace, "mcp-server.cjs");

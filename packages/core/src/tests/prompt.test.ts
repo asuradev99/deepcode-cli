@@ -7,11 +7,14 @@ import { fileURLToPath } from "url";
 import {
   buildSkillCatalogPrompt,
   buildSkillDocumentsPrompt,
+  getCompactPrompt,
+  getCompactPromptMaxChars,
   getPlanModePrompt,
   getRuntimeContext,
   getSystemPrompt,
   getTools,
 } from "../prompt";
+import type { SessionMessage } from "../session";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const tempDirs: string[] = [];
@@ -322,4 +325,63 @@ test("deepseek-flash uses native image tools unless multimodal is disabled", () 
     assert.equal(prompt.includes("## ReadImage"), native);
     assert.equal(prompt.includes("## UnderstandImage"), !native);
   }
+});
+
+function buildCompactTestMessage(
+  id: string,
+  role: SessionMessage["role"],
+  content: string,
+  contentParams: unknown = null
+): SessionMessage {
+  return {
+    id,
+    sessionId: "compact-test-session",
+    role,
+    content,
+    contentParams,
+    messageParams: null,
+    compacted: false,
+    visible: true,
+    createTime: "2026-01-01T00:00:00.000Z",
+    updateTime: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+test("getCompactPrompt redacts inline image payloads instead of embedding base64", () => {
+  const base64Payload = "QUJD".repeat(500_000);
+  const messages: SessionMessage[] = [
+    buildCompactTestMessage("user-1", "user", "Review the screenshot.", [
+      { type: "image_url", image_url: { url: `data:image/png;base64,${base64Payload}` } },
+    ]),
+    buildCompactTestMessage("assistant-1", "assistant", "Looks good."),
+    buildCompactTestMessage("tool-1", "tool", "done"),
+    buildCompactTestMessage("user-2", "user", "Continue."),
+  ];
+
+  const prompt = getCompactPrompt(messages);
+
+  assert.equal(prompt.includes("data:image/png;base64"), false);
+  assert.equal(prompt.includes(base64Payload), false);
+  assert.match(prompt, /\[image omitted from compaction: image\/png, ~\d+ bytes\]/);
+  assert.ok(prompt.length < 10_000, `expected a small compaction prompt, got ${prompt.length} chars`);
+});
+
+test("getCompactPrompt bounds the serialized conversation to the given budget", () => {
+  const messages = Array.from({ length: 400 }, (_, index) =>
+    buildCompactTestMessage(`message-${index}`, "user", `marker-${index} ${"x".repeat(1_000)}`)
+  );
+
+  const prompt = getCompactPrompt(messages, 20_000);
+
+  assert.ok(prompt.length <= 30_000, `expected a bounded prompt, got ${prompt.length} chars`);
+  assert.match(prompt, /messages omitted from compaction to fit the context window/);
+  assert.equal(prompt.includes("marker-0 "), true);
+  assert.equal(prompt.includes("marker-399 "), true);
+});
+
+test("getCompactPromptMaxChars scales with the context window and is unbounded when unknown", () => {
+  assert.equal(getCompactPromptMaxChars(undefined), Number.POSITIVE_INFINITY);
+  assert.equal(getCompactPromptMaxChars(0), Number.POSITIVE_INFINITY);
+  assert.equal(getCompactPromptMaxChars(1024 * 1024), Math.floor(1024 * 1024 * 0.75 * 2));
+  assert.ok(getCompactPromptMaxChars(256 * 1024) > 0);
 });

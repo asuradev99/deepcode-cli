@@ -293,19 +293,127 @@ export function getSystemPrompt(_projectRoot: string, options: PromptToolOptions
   return toolDocs ? `${SYSTEM_PROMPT_BASE}\n\n# Available Tools\n\n${toolDocs}` : SYSTEM_PROMPT_BASE;
 }
 
-export function getCompactPrompt(sessionMessages: SessionMessage[]): string {
-  const jsonl = sessionMessages
-    .map((message) =>
-      JSON.stringify({
-        id: message.id,
-        role: message.role,
-        content: message.content,
-        contentParams: message.contentParams,
-        messageParams: message.messageParams,
-        createTime: message.createTime,
-      })
-    )
-    .join("\n");
+/**
+ * The compaction request is a single text message, so any inline image payload
+ * (a base64 `data:` URL from `ReadImage`) is tokenized as raw text instead of
+ * being sent as a vision `image_url` part. A single 4 MiB screenshot expands to
+ * ~5.5M base64 characters and can push the summarization request past the model
+ * context window, failing the whole session. Replace those payloads with a short
+ * textual placeholder — the summarizer only needs to know an image existed.
+ */
+function redactImagePayloads(contentParams: unknown): unknown {
+  if (contentParams == null) {
+    return contentParams;
+  }
+  const params = Array.isArray(contentParams) ? contentParams : [contentParams];
+  return params.map((param) => {
+    if (!param || typeof param !== "object" || Array.isArray(param)) {
+      return param;
+    }
+    const part = param as { type?: unknown; image_url?: unknown };
+    if (part.type !== "image_url") {
+      return param;
+    }
+    const rawUrl =
+      part.image_url && typeof part.image_url === "object" ? (part.image_url as { url?: unknown }).url : undefined;
+    return { type: "text", text: describeOmittedImage(typeof rawUrl === "string" ? rawUrl : "") };
+  });
+}
+
+function describeOmittedImage(url: string): string {
+  const match = /^data:([^;,]+)?(?:;base64)?,([\s\S]*)$/i.exec(url);
+  if (!match) {
+    const shown = url.length > 200 ? `${url.slice(0, 200)}…` : url;
+    return `[image omitted from compaction: ${shown}]`;
+  }
+  const mediaType = match[1] || "image";
+  const bytes = Math.floor(((match[2] ?? "").length * 3) / 4);
+  return `[image omitted from compaction: ${mediaType}, ~${bytes} bytes]`;
+}
+
+const COMPACT_PROMPT_MIN_CHARS = 16_000;
+const COMPACT_PROMPT_OMITTED_MARKER_PREFIX = "messages omitted from compaction to fit the context window";
+
+/**
+ * Assumed input characters per token for the compaction request. Real text is
+ * usually ~3-4 chars/token, base64 is worse; 2 is a conservative floor so the
+ * derived budget stays under the model's context window.
+ */
+export const COMPACT_PROMPT_CHARS_PER_TOKEN = 2;
+
+/** Fraction of the context window the compaction prompt is allowed to consume. */
+export const COMPACT_PROMPT_WINDOW_FRACTION = 0.75;
+
+/** Character budget for the serialized conversation inside the compaction prompt. */
+export function getCompactPromptMaxChars(contextWindow?: number): number {
+  if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.max(
+    COMPACT_PROMPT_MIN_CHARS,
+    Math.floor(contextWindow * COMPACT_PROMPT_WINDOW_FRACTION * COMPACT_PROMPT_CHARS_PER_TOKEN)
+  );
+}
+
+/** Keeps the head (original request) and tail (most recent work), dropping the middle when over budget. */
+function joinCompactLines(lines: string[], maxChars: number): string {
+  if (!Number.isFinite(maxChars)) {
+    return lines.join("\n");
+  }
+  const totalChars = lines.reduce((sum, line) => sum + line.length + 1, 0);
+  if (totalChars <= maxChars) {
+    return lines.join("\n");
+  }
+
+  const markerBudget = 120;
+  const half = Math.max(0, Math.floor((maxChars - markerBudget) / 2));
+  const head: string[] = [];
+  let headChars = 0;
+  for (const line of lines) {
+    if (headChars + line.length + 1 > half) {
+      break;
+    }
+    head.push(line);
+    headChars += line.length + 1;
+  }
+
+  const tail: string[] = [];
+  let tailChars = 0;
+  for (let index = lines.length - 1; index >= head.length; index -= 1) {
+    if (tailChars + lines[index].length + 1 > half) {
+      break;
+    }
+    tail.unshift(lines[index]);
+    tailChars += lines[index].length + 1;
+  }
+
+  if (head.length === 0 && tail.length === 0) {
+    // A single message is larger than the budget: keep its newest, truncated end
+    // so the summarizer still has something to work with.
+    const newest = lines[lines.length - 1] ?? "";
+    return newest.length > maxChars ? `${newest.slice(0, Math.max(0, maxChars - 1))}…` : newest;
+  }
+
+  const omittedCount = lines.length - head.length - tail.length;
+  const marker = JSON.stringify({
+    role: "system",
+    content: `[... ${omittedCount} ${COMPACT_PROMPT_OMITTED_MARKER_PREFIX} ...]`,
+  });
+  return [...head, marker, ...tail].join("\n");
+}
+
+export function getCompactPrompt(sessionMessages: SessionMessage[], maxChars = Number.POSITIVE_INFINITY): string {
+  const lines = sessionMessages.map((message) =>
+    JSON.stringify({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+      contentParams: redactImagePayloads(message.contentParams),
+      messageParams: message.messageParams,
+      createTime: message.createTime,
+    })
+  );
+  const jsonl = joinCompactLines(lines, maxChars);
   return `${COMPACT_PROMPT_BASE}\n\nconversation below:\n\n\`\`\`jsonl\n${jsonl}\n\`\`\``;
 }
 

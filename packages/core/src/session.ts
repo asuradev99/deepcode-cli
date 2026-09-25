@@ -14,6 +14,7 @@ import {
   buildSkillCatalogPrompt,
   buildSkillDocumentsPrompt,
   getCompactPrompt,
+  getCompactPromptMaxChars,
   getExtensionRoot,
   getPlanModePrompt,
   getRuntimeContext,
@@ -1765,7 +1766,22 @@ ${agentInstructions}
           );
           message.meta = { asThinking: true };
           this.onAssistantMessage(message, false);
-          await this.compactSession(sessionId, sessionController.signal);
+          try {
+            await this.compactSession(sessionId, sessionController.signal);
+          } catch (error) {
+            // A failed summarization request must not end the conversation: keep
+            // the existing history and let the next request try to proceed.
+            if (sessionController.signal.aborted || this.isAbortLikeError(error)) {
+              throw error;
+            }
+            const skippedMessage = this.buildAssistantMessage(
+              sessionId,
+              "Compaction was skipped because the summary request failed; continuing with the current conversation.",
+              null
+            );
+            skippedMessage.meta = { asThinking: true };
+            this.onAssistantMessage(skippedMessage, false);
+          }
         }
 
         const sessionMessages = await this.attachPromptImagesForRequest(
@@ -1992,7 +2008,8 @@ ${agentInstructions}
       return;
     }
 
-    const compactPrompt = getCompactPrompt(sessionMessages.slice(startIndex, endIndex));
+    const compactPromptMaxChars = getCompactPromptMaxChars(this.getResolvedSettings().contextWindow);
+    const compactPrompt = getCompactPrompt(sessionMessages.slice(startIndex, endIndex), compactPromptMaxChars);
     const thinkingOptions = buildThinkingRequestOptions(thinkingEnabled, baseURL, reasoningEffort);
     const response = await this.createChatCompletionStream(
       client,
